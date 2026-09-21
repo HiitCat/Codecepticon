@@ -10,6 +10,7 @@ using Codecepticon.CommandLine;
 using Codecepticon.Modules.CSharp.Rewriters;
 using Codecepticon.Utils;
 using Microsoft.CodeAnalysis.Text;
+using System.Xml.Linq;
 
 namespace Codecepticon.Modules.CSharp
 {
@@ -70,11 +71,11 @@ namespace Codecepticon.Modules.CSharp
             string code = File.ReadAllText(CommandLineData.Global.Rewrite.Template.File);
             string mapping;
 
-            // Find all variables that look like $_NAME_%
+            // Find all template placeholders in format %_NAME_%
             Regex regex = new Regex(@"(%_[A-Za-z0-9_]+_%)");
             var matches = regex.Matches(code).Cast<Match>().Select(m => m.Value).ToArray().Distinct();
 
-            // And now replace them all. We only need to keep track of the Namespace, Class, and Function names.
+            // Replace each placeholder with a unique generated identifier
             foreach (var match in matches)
             {
                 string name = CommandLineData.Global.NameGenerator.Generate();
@@ -97,6 +98,7 @@ namespace Codecepticon.Modules.CSharp
                 code = code.Replace(match, name);
             }
 
+            // Inject mapping content if required by the encoding method
             switch (CommandLineData.Global.Rewrite.EncodingMethod)
             {
                 case StringEncoding.StringEncodingMethods.SingleCharacterSubstitution:
@@ -114,9 +116,90 @@ namespace Codecepticon.Modules.CSharp
 
             SourceText source = SourceText.From(code);
             CommandLineData.Global.Rewrite.Template.AddedFile = GenerateStringFileName(project);
-            Logger.Debug($"File added into project for strings: {CommandLineData.Global.Rewrite.Template.AddedFile}");
-            Document document = project.AddDocument(CommandLineData.Global.Rewrite.Template.AddedFile, source);
-            return solution.AddDocument(document.Id, CommandLineData.Global.Rewrite.Template.AddedFile, source);
+            string addedFileName = CommandLineData.Global.Rewrite.Template.AddedFile;
+
+            // Compute file path relative to project directory to ensure .csproj Include attribute is correct
+            string addedFilePath;
+            string relativePathForCsproj = addedFileName;
+            if (!string.IsNullOrEmpty(project?.FilePath))
+            {
+                var projectDir = Path.GetDirectoryName(project.FilePath);
+                addedFilePath = Path.Combine(projectDir, addedFileName);
+                // relative path from project dir for csproj Include
+                relativePathForCsproj = addedFileName;
+            }
+            else
+            {
+                addedFilePath = Path.GetFullPath(addedFileName);
+                relativePathForCsproj = Path.GetFileName(addedFilePath);
+            }
+
+            Logger.Debug($"File added into project for strings: {addedFileName} (path: {addedFilePath})");
+
+            // Write the file to disk early so it can be referenced by .csproj (AdhocWorkspace may not sync automatically)
+            try
+            {
+                var dir = Path.GetDirectoryName(addedFilePath);
+                if (!String.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                }
+                File.WriteAllText(addedFilePath, code, Encoding.UTF8);
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to write helper file to disk: {ex.Message}");
+            }
+
+            // Update .csproj to include the new helper file so MSBuild recognizes it for compilation
+            if (!String.IsNullOrEmpty(project?.FilePath) && File.Exists(project.FilePath))
+            {
+                try
+                {
+                    var csprojPath = project.FilePath;
+                    var xdoc = System.Xml.Linq.XDocument.Load(csprojPath);
+                    XNamespace ns = xdoc.Root.GetDefaultNamespace();
+
+                    bool alreadyIncluded = xdoc.Descendants(ns + "Compile")
+                                               .Attributes("Include")
+                                               .Any(a => String.Equals(a.Value.Replace('\\','/'), relativePathForCsproj.Replace('\\','/'), StringComparison.OrdinalIgnoreCase));
+
+                    if (!alreadyIncluded)
+                    {
+                        var itemGroup = xdoc.Descendants(ns + "ItemGroup").FirstOrDefault();
+                        if (itemGroup == null)
+                        {
+                            itemGroup = new System.Xml.Linq.XElement(ns + "ItemGroup");
+                            xdoc.Root.Add(itemGroup);
+                        }
+
+                        var compileElem = new System.Xml.Linq.XElement(ns + "Compile");
+                        compileElem.SetAttributeValue("Include", relativePathForCsproj);
+                        itemGroup.Add(compileElem);
+
+                        xdoc.Save(csprojPath);
+                        Logger.Debug($"Added <Compile Include=\"{relativePathForCsproj}\" /> to {csprojPath}");
+                    }
+                    else
+                    {
+                        Logger.Debug($"Helper file already included in csproj: {relativePathForCsproj}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warning($"Failed to update csproj to include helper file: {ex.Message}");
+                }
+            }
+            else
+            {
+                Logger.Debug("Project file path not available - skipping .csproj update.");
+            }
+
+            // Add document to Roslyn solution with absolute path to enable proper document tracking
+            var did = DocumentId.CreateNewId(project.Id);
+            solution = solution.AddDocument(did, addedFileName, source, folders: null, filePath: addedFilePath);
+
+            return solution;
         }
 
         protected string GenerateStringFileName(Project project)

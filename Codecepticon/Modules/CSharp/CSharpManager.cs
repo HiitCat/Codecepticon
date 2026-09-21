@@ -55,96 +55,201 @@ namespace Codecepticon.Modules.CSharp
                 { "Configuration", "Release" }
             };
 
-            using (var workspace = VisualStudioManager.GetWorkspace(workspaceProperties))
+            Workspace workspace = null;
+            try
+            {
+                workspace = VisualStudioManager.GetWorkspace(workspaceProperties);
+            }
+            catch (Exception)
+            {
+                Logger.Warning("GetWorkspace failed, creating fallback workspace.");
+                workspace = VisualStudioManager.CreateWorkspaceFromSolutionFile(CommandLineData.Global.Project.Path);
+            }
+
+            try
             {
                 Logger.Info($"Loading solution: {CommandLineData.Global.Project.Path}");
-                workspace.WorkspaceFailed += (o, e) => Logger.Debug(e.Diagnostic.Message);
-                Solution solution = await workspace.OpenSolutionAsync(CommandLineData.Global.Project.Path);
-                Logger.Verbose("Finished loading solution");
+                if (workspace is Microsoft.CodeAnalysis.MSBuild.MSBuildWorkspace msbuildWorkspace)
+                {
+                    msbuildWorkspace.WorkspaceFailed += (o, e) => Logger.Debug(e.Diagnostic.Message);
+                    try
+                    {
+                        var solution = await msbuildWorkspace.OpenSolutionAsync(CommandLineData.Global.Project.Path);
+                        Logger.Verbose("Finished loading solution");
+                        await ContinueObfuscationWithSolution(workspace, solution);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Warning("MSBuildWorkspace failed, using fallback AdhocWorkspace: " + ex.Message);
+                        // Dispose msbuildWorkspace and create fallback
+                        msbuildWorkspace.Dispose();
+                        workspace = VisualStudioManager.CreateWorkspaceFromSolutionFile(CommandLineData.Global.Project.Path);
+                        var solution = workspace.CurrentSolution;
+                        Logger.Verbose("Finished loading solution (fallback)");
+                        await ContinueObfuscationWithSolution(workspace, solution);
+                    }
+                }
+                else
+                {
+                    // Already an AdhocWorkspace (fallback)
+                    var solution = workspace.CurrentSolution;
+                    Logger.Verbose("Finished loading solution (fallback)");
+                    await ContinueObfuscationWithSolution(workspace, solution);
+                }
+            }
+            finally
+            {
+                workspace?.Dispose();
+            }
+        }
+
+        // Extracted to share obfuscation logic between MSBuildWorkspace and fallback AdhocWorkspace paths
+        private static async Task ContinueObfuscationWithSolution(Workspace workspace, Solution solution)
+        {
+            Logger.Verbose("");
+
+            // Check if we're in fallback mode by detecting unavailable build projects
+            bool anyBuildProjectMissing = false;
+            foreach (var proj in solution.Projects)
+            {
+                var buildProj = VisualStudioManager.GetBuildProject(proj);
+                if (buildProj == null)
+                {
+                    anyBuildProjectMissing = true;
+                    Logger.Warning($"GetBuildProject failed for project '{proj.Name}'. Build/configuration steps will be skipped for fallback workspace.");
+                    break;
+                }
+            }
+
+            if (CommandLineData.CSharp.Compilation.Precompile && anyBuildProjectMissing)
+            {
+                Logger.Warning("Precompile requested but build system is not available for fallback workspace. Skipping precompile.");
+            }
+
+            if (CommandLineData.CSharp.Compilation.Precompile && !anyBuildProjectMissing)
+            {
+                Logger.Info("Pre-compiling the original project to check if it is successful...", false);
+                if (!VisualStudioManager.Build(solution, new Dictionary<string, string> { { "Configuration", "Release" } } ))
+                {
+                    if (!Logger.IsDebug)
+                    {
+                        Logger.Error("ERROR", true, false);
+                    }
+                    Logger.Error("Could not compile original project in 'Release' mode, make sure there are no errors and try again - or run Codecepticon with --debug.");
+                    return;
+                }
+                Logger.Info("OK", true, false);
+            }
+
+            if (solution.Projects.Count() > 1)
+            {
+                Logger.Warning($"This solution has {solution.Projects.Count()} projects. Codecepticon only supports single-project solutions.");
+                Logger.Warning($"You can still give it a go, but tread carefully - here be dragons");
+
+                string userResponse;
+                do
+                {
+                    Logger.Warning("Continue? (Y/N): ", false);
+                    userResponse = Console.ReadLine().ToLower();
+                } while (userResponse != "y" && userResponse != "n");
+
+                if (userResponse == "n")
+                {
+                    Logger.Error("Aborted by user");
+                    return;
+                }
+            }
+
+            foreach (Project project in solution.Projects)
+            {
+                Logger.Info($"Processing project {project.FilePath ?? project.Name}");
+                await GatherProjectData(solution, project);
+                await DataCollector.FilterCollectedData();
+
                 Logger.Verbose("");
+                Logger.Verbose("Elements Found:");
+                Logger.Verbose($"\tNamespaces:\t{DataCollector.AllNamespaces.Count}");
+                Logger.Verbose($"\tClasses:\t{DataCollector.AllClasses.Count}");
+                Logger.Verbose($"\tEnums:\t\t{DataCollector.AllEnums.Count}");
+                Logger.Verbose($"\tFunctions:\t{DataCollector.AllFunctions.Count}");
+                Logger.Verbose($"\tProperties:\t{DataCollector.AllProperties.Count}");
+                Logger.Verbose($"\tParameters:\t{DataCollector.AllParameters.Count}");
+                Logger.Verbose($"\tVariables:\t{DataCollector.AllVariables.Count}");
+                Logger.Verbose($"\tStructs:\t{DataCollector.AllStructs.Count}");
 
-                if (CommandLineData.CSharp.Compilation.Precompile)
+                Logger.Info("Generating mappings...");
+                if (await GenerateMappings() == false)
                 {
-                    Logger.Info("Pre-compiling the original project to check if it is successful...", false);
-                    if (!VisualStudioManager.Build(solution, new Dictionary<string, string> { { "Configuration", "Release" } } ))
-                    {
-                        if (!Logger.IsDebug)
-                        {
-                            Logger.Error("ERROR", true, false);
-                        }
-                        Logger.Error("Could not compile original project in 'Release' mode, make sure there are no errors and try again - or run Codecepticon with --debug.");
-                        return;
-                    }
-                    Logger.Info("OK", true, false);
+                    Logger.Error("Could not generate mappings.");
+                    return;
                 }
 
-                if (solution.Projects.Count() > 1)
-                {
-                    Logger.Warning($"This solution has {solution.Projects.Count()} projects. Codecepticon only supports single-project solutions.");
-                    Logger.Warning($"You can still give it a go, but tread carefully - here be dragons");
+                Logger.Info("Rewriting code...");
+                solution = await RewriteCode(solution, project);
+            }
 
-                    string userResponse;
-                    do
-                    {
-                        Logger.Warning("Continue? (Y/N): ", false);
-                        userResponse = Console.ReadLine().ToLower();
-                    } while (userResponse != "y" && userResponse != "n");
-
-                    if (userResponse == "n")
-                    {
-                        Logger.Error("Aborted by user");
-                        return;
-                    }
-                }
-
-                foreach (Project project in solution.Projects)
-                {
-                    Logger.Info($"Processing project {project.FilePath}");
-                    await GatherProjectData(solution, project);
-                    await DataCollector.FilterCollectedData();
-
-                    Logger.Verbose("");
-                    Logger.Verbose("Elements Found:");
-                    Logger.Verbose($"\tNamespaces:\t{DataCollector.AllNamespaces.Count}");
-                    Logger.Verbose($"\tClasses:\t{DataCollector.AllClasses.Count}");
-                    Logger.Verbose($"\tEnums:\t\t{DataCollector.AllEnums.Count}");
-                    Logger.Verbose($"\tFunctions:\t{DataCollector.AllFunctions.Count}");
-                    Logger.Verbose($"\tProperties:\t{DataCollector.AllProperties.Count}");
-                    Logger.Verbose($"\tParameters:\t{DataCollector.AllParameters.Count}");
-                    Logger.Verbose($"\tVariables:\t{DataCollector.AllVariables.Count}");
-                    Logger.Verbose($"\tStructs:\t{DataCollector.AllStructs.Count}");
-
-                    Logger.Info("Generating mappings...");
-                    if (await GenerateMappings() == false)
-                    {
-                        Logger.Error("Could not generate mappings.");
-                        return;
-                    }
-
-                    Logger.Info("Rewriting code...");
-                    solution = await RewriteCode(solution, project);
-                }
-
+            // Skip configuration steps if build project is unavailable (fallback mode)
+            if (!anyBuildProjectMissing)
+            {
                 VisualStudioManager.SetProjectConfiguration(solution, new Dictionary<string, string> { { "Configuration", CommandLineData.CSharp.Compilation.Configuration } });
                 VisualStudioManager.SetProjectConfiguration(solution, CommandLineData.CSharp.Compilation.Settings);
+            }
+            else
+            {
+                Logger.Warning("Skipping SetProjectConfiguration because build integration is not available in fallback workspace.");
+            }
 
-                Logger.Info("Applying changes to solution...");
-                workspace.TryApplyChanges(solution);
+            Logger.Info("Applying changes to solution...");
+            workspace.TryApplyChanges(solution);
 
-                // At this point, when everything has been applied, we can do any final project-wide updates.
-                if (CommandLineData.CSharp.Profile != null)
+            // When using fallback AdhocWorkspace, manually persist changes to disk since it doesn't auto-save
+            if (workspace is Microsoft.CodeAnalysis.AdhocWorkspace)
+            {
+                Logger.Warning("Persisting modified documents to disk (fallback workspace). Make a backup before proceeding.");
+                foreach (var proj in solution.Projects)
                 {
-                    Logger.Info("Running profile-specific final actions...", false);
-                    foreach (Project project in solution.Projects)
+                    foreach (var doc in proj.Documents)
                     {
-                        solution = await CommandLineData.CSharp.Profile.Final(solution, project);
+                        try
+                        {
+                            if (String.IsNullOrEmpty(doc.FilePath))
+                            {
+                                Logger.Debug($"Skipping document with no FilePath: {doc.Name}");
+                                continue;
+                            }
+
+                            var text = await doc.GetTextAsync();
+                            System.IO.File.WriteAllText(doc.FilePath, text.ToString(), System.Text.Encoding.UTF8);
+                            Logger.Debug($"Wrote file: {doc.FilePath}");
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.Warning($"Failed to write document '{doc.Name}' to '{doc.FilePath}': {ex.Message}");
+                        }
                     }
-                    Logger.Info("", true, false);
-                    Logger.Info("Applying changes (again) to solution...");
-                    workspace.TryApplyChanges(solution);
                 }
-                
-                if (CommandLineData.CSharp.Compilation.Build)
+            }
+
+            // Final profile actions
+            if (CommandLineData.CSharp.Profile != null)
+            {
+                Logger.Info("Running profile-specific final actions...", false);
+                foreach (Project project in solution.Projects)
+                {
+                    solution = await CommandLineData.CSharp.Profile.Final(solution, project);
+                }
+                Logger.Info("", true, false);
+                Logger.Info("Applying changes (again) to solution...");
+                workspace.TryApplyChanges(solution);
+            }
+
+            if (CommandLineData.CSharp.Compilation.Build)
+            {
+                if (anyBuildProjectMissing)
+                {
+                    Logger.Warning("Build requested but unavailable for fallback workspace. Skipping build step.");
+                }
+                else
                 {
                     Logger.Info("Building solution...", false);
                     if (!VisualStudioManager.Build(solution))

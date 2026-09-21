@@ -51,6 +51,12 @@ namespace Codecepticon
                 return;
             }
 
+            // Register MSBuild early for CSharp module to prevent conflicts with Roslyn/MSBuild types loaded later
+            if (module == CodecepticonModules.CSharp)
+            {
+                VisualStudioManager.EnsureMSBuildRegistered();
+            }
+
             Logger.Debug("Global Command Line Data");
             Logger.Debug(JsonConvert.SerializeObject(CommandLineData.Global));
 
